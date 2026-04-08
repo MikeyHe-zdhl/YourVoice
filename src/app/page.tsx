@@ -17,6 +17,14 @@ import {
   Settings2
 } from 'lucide-react';
 import type { FFmpeg as FFmpegType } from '@ffmpeg/ffmpeg';
+import AnalyticsDashboard from './components/AnalyticsDashboard';
+import SubtitleEditor from './components/SubtitleEditor';
+import { AnalyticsService } from './services/analyticsService';
+import { SubtitleService, type SubtitleSegment } from './services/subtitleService';
+import {
+  VideoAnalysisService,
+  type VideoAnalysis,
+} from './services/videoAnalysisService';
 
 type ProcessingMode = 'dubbing' | 'vlog';
 
@@ -37,6 +45,11 @@ export default function Home() {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
+  const [generatingSubtitles, setGeneratingSubtitles] = useState(false);
+  const [aiSubtitles, setAiSubtitles] = useState<SubtitleSegment[]>([]);
+  const [videoAnalysis, setVideoAnalysis] = useState<VideoAnalysis | null>(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   
   const ffmpegRef = useRef<FFmpegType | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -76,11 +89,25 @@ export default function Home() {
     }
   };
 
-  const handleVideoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleVideoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setVideoFile(e.target.files[0]);
+      const nextVideoFile = e.target.files[0];
+      setVideoFile(nextVideoFile);
       setOutputVideo(null); 
       setVttUrl(null);
+      setAiSubtitles([]);
+      setSubtitleFile(null);
+      setAnalysisLoading(true);
+
+      try {
+        const analysis = await VideoAnalysisService.analyzeVideo(nextVideoFile);
+        setVideoAnalysis(analysis);
+      } catch (error) {
+        console.error('Video analysis failed:', error);
+        setVideoAnalysis(null);
+      } finally {
+        setAnalysisLoading(false);
+      }
     }
   };
 
@@ -104,6 +131,7 @@ export default function Home() {
 
   const processVideo = async () => {
     const ffmpeg = ffmpegRef.current;
+    const startTime = Date.now();
     if (!ffmpeg || !loaded) {
       alert('引擎尚未就绪，请稍后');
       return;
@@ -124,6 +152,9 @@ export default function Home() {
     setProgress(0);
     setStatus('正在读取素材文件...');
 
+    const duration = await getVideoDuration(videoFile);
+    const videoSize = videoFile.size / (1024 * 1024);
+
     try {
       await ffmpeg.writeFile('input_video.mp4', await fetchFile(videoFile));
       
@@ -131,7 +162,7 @@ export default function Home() {
         // --- DUBBING MODE ---
         await ffmpeg.writeFile('input_audio.mp3', await fetchFile(audioFile!));
         
-        let ffmpegArgs = [
+        const ffmpegArgs = [
           '-i', 'input_video.mp4',
           '-i', 'input_audio.mp3'
         ];
@@ -143,7 +174,7 @@ export default function Home() {
           setStatus('正在生成预览字幕 (VTT)...');
           await ffmpeg.exec(['-i', 'input_sub.srt', 'preview.vtt']);
           const vttData = await ffmpeg.readFile('preview.vtt');
-          const vttBlobUrl = URL.createObjectURL(new Blob([(vttData as any).buffer], { type: 'text/vtt' }));
+          const vttBlobUrl = URL.createObjectURL(new Blob([toBlobPart(vttData)], { type: 'text/vtt' }));
           setVttUrl(vttBlobUrl);
 
           // Task B: Synthesis with subtitle stream
@@ -193,16 +224,111 @@ export default function Home() {
 
       setStatus('读取合成后的文件...');
       const data = await ffmpeg.readFile('output.mp4');
-      const url = URL.createObjectURL(new Blob([(data as any).buffer], { type: 'video/mp4' }));
+      const url = URL.createObjectURL(new Blob([toBlobPart(data)], { type: 'video/mp4' }));
       setOutputVideo(url);
       setStatus('合成完成！');
+
+      AnalyticsService.recordProcessing({
+        mode,
+        videoSize,
+        duration,
+        processingTime: (Date.now() - startTime) / 1000,
+        success: true,
+        features: {
+          hasSubtitle: !!subtitleFile,
+          hasBGM: bgmFiles.length > 0,
+          aiSubtitleGenerated: aiSubtitles.length > 0,
+        },
+      });
+      setAnalyticsRefreshKey((value) => value + 1);
     } catch (error) {
       console.error('FFmpeg processing error:', error);
       alert('处理过程中发生错误，请查看控制台。');
       setStatus('处理出错');
+
+      AnalyticsService.recordProcessing({
+        mode,
+        videoSize,
+        duration,
+        processingTime: (Date.now() - startTime) / 1000,
+        success: false,
+        errorMessage: error instanceof Error ? error.message : '未知错误',
+        features: {
+          hasSubtitle: !!subtitleFile,
+          hasBGM: bgmFiles.length > 0,
+          aiSubtitleGenerated: aiSubtitles.length > 0,
+        },
+      });
+      setAnalyticsRefreshKey((value) => value + 1);
     } finally {
       setProcessing(false);
     }
+  };
+
+  const generateAISubtitles = async () => {
+    const ffmpeg = ffmpegRef.current;
+    if (!ffmpeg || !loaded) {
+      alert('引擎尚未就绪，请稍后再试');
+      return;
+    }
+
+    if (!videoFile) {
+      alert('请先上传视频文件');
+      return;
+    }
+
+    setGeneratingSubtitles(true);
+    setProgress(0);
+
+    try {
+      setStatus('正在提取视频音频...');
+      const audioBlob = await SubtitleService.extractAudio(videoFile, ffmpeg);
+
+      setStatus('Whisper 正在识别语音...');
+      const segments = await SubtitleService.generateSubtitles(audioBlob, 'zh');
+
+      if (segments.length === 0) {
+        throw new Error('未识别到可用字幕内容');
+      }
+
+      setAiSubtitles(segments);
+      setStatus(`AI 字幕生成完成，共 ${segments.length} 条`);
+    } catch (error) {
+      console.error('AI subtitle generation error:', error);
+      const message =
+        error instanceof Error ? error.message : '字幕生成失败，请检查控制台日志';
+      alert(message);
+      setStatus('AI 字幕生成失败');
+    } finally {
+      setGeneratingSubtitles(false);
+    }
+  };
+
+  const applyAISubtitles = () => {
+    if (aiSubtitles.length === 0) {
+      alert('当前没有可应用的 AI 字幕');
+      return;
+    }
+
+    const srtContent = SubtitleService.convertToSRT(aiSubtitles);
+    const nextSubtitleFile = new File([srtContent], 'yourvoice-ai-subtitles.srt', {
+      type: 'text/plain',
+    });
+
+    setSubtitleFile(nextSubtitleFile);
+    setStatus('AI 字幕已应用，现在可以直接开始合成视频');
+  };
+
+  const resetWorkspace = () => {
+    setOutputVideo(null);
+    setVideoFile(null);
+    setAudioFile(null);
+    setSubtitleFile(null);
+    setBgmFiles([]);
+    setVttUrl(null);
+    setAiSubtitles([]);
+    setVideoAnalysis(null);
+    setStatus('引擎准备就绪');
   };
 
   return (
@@ -286,20 +412,35 @@ export default function Home() {
                   <div className="space-y-2">
                     <div className="flex items-center justify-between ml-1">
                       <label className="text-[13px] font-semibold text-gray-400 uppercase tracking-wider">📝 上传字幕文件</label>
-                      {subtitleFile && <span className="text-[10px] font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded-md uppercase">已就绪</span>}
+                      <div className="flex items-center gap-2">
+                        {subtitleFile && <span className="text-[10px] font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded-md uppercase">已就绪</span>}
+                        <button
+                          type="button"
+                          onClick={generateAISubtitles}
+                          disabled={!videoFile || generatingSubtitles || !loaded}
+                          className="rounded-full bg-gradient-to-r from-blue-600 to-cyan-500 px-3 py-1 text-[11px] font-bold text-white transition hover:from-blue-700 hover:to-cyan-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {generatingSubtitles ? '生成中...' : 'AI 生成字幕'}
+                        </button>
+                      </div>
                     </div>
                     <div className={`relative border-2 border-dashed rounded-2xl p-6 transition-all hover:border-blue-400 hover:bg-blue-50/20 group ${subtitleFile ? 'border-blue-200 bg-blue-50/10' : 'border-gray-100'}`}>
-                      <input type="file" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" accept=".srt" onChange={handleSubtitleChange} />
+                      <input type="file" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" accept=".srt,.vtt" onChange={handleSubtitleChange} />
                       <div className="flex items-center gap-4">
                         <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors ${subtitleFile ? 'bg-blue-500 text-white' : 'bg-gray-50 text-gray-400 group-hover:text-blue-500'}`}>
                           <FileText className="w-6 h-6" />
                         </div>
                         <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium truncate">{subtitleFile ? subtitleFile.name : '点击上传 SRT 字幕 (可选)'}</p>
-                          <p className="text-xs text-gray-400">支持自动封装进 MP4</p>
+                          <p className="text-sm font-medium truncate">{subtitleFile ? subtitleFile.name : '点击上传 SRT/VTT 字幕 (可选)'}</p>
+                          <p className="text-xs text-gray-400">支持手动上传或用 AI 自动生成后封装进 MP4</p>
                         </div>
                       </div>
                     </div>
+                    {!process.env.NEXT_PUBLIC_OPENAI_API_KEY && (
+                      <p className="text-xs text-amber-600">
+                        需要在项目根目录的 <code>.env.local</code> 中配置 <code>NEXT_PUBLIC_OPENAI_API_KEY</code> 后才能使用 AI 字幕。
+                      </p>
+                    )}
                   </div>
 
                   <div className="pt-4 border-t border-gray-50">
@@ -374,6 +515,16 @@ export default function Home() {
                 )}
               </div>
             </section>
+
+            {aiSubtitles.length > 0 && (
+              <SubtitleEditor
+                segments={aiSubtitles}
+                onUpdate={setAiSubtitles}
+                onApply={applyAISubtitles}
+              />
+            )}
+
+            <AnalyticsDashboard refreshKey={analyticsRefreshKey} />
           </div>
 
           <div className="lg:col-span-7">
@@ -399,10 +550,10 @@ export default function Home() {
               {outputVideo ? (
                 <div className="flex gap-4 animate-in slide-in-from-top-4 duration-500">
                   <a href={outputVideo} download="yourvoice_creation.mp4" className="flex-[2] h-16 bg-blue-600 text-white rounded-[1.25rem] flex items-center justify-center gap-3 font-bold hover:bg-blue-700 transition-all shadow-xl shadow-blue-500/20 active:scale-95"><Download className="w-5 h-5" /> 下载成品视频</a>
-                  <button onClick={() => { setOutputVideo(null); setVideoFile(null); setAudioFile(null); setSubtitleFile(null); setBgmFiles([]); setVttUrl(null); setStatus('引擎准备就绪'); }} className="flex-1 h-16 bg-white border border-gray-200 rounded-[1.25rem] font-bold hover:bg-gray-50 transition-all active:scale-95">重置</button>
+                  <button onClick={resetWorkspace} className="flex-1 h-16 bg-white border border-gray-200 rounded-[1.25rem] font-bold hover:bg-gray-50 transition-all active:scale-95">重置</button>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
                   <div className="p-6 bg-white rounded-3xl border border-gray-100 shadow-sm">
                     <CheckCircle2 className="w-5 h-5 text-blue-500 mb-3" />
                     <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-1">字幕封装</h3>
@@ -415,6 +566,84 @@ export default function Home() {
                   </div>
                 </div>
               )}
+
+              <section className="rounded-[2rem] border border-gray-100 bg-white p-8 shadow-xl shadow-black/5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] font-bold uppercase tracking-[0.3em] text-fuchsia-500">
+                      AI Content Insight
+                    </p>
+                    <h3 className="mt-2 text-2xl font-bold tracking-tight text-[#1d1d1f]">
+                      视频内容分析
+                    </h3>
+                    <p className="mt-1 text-sm text-gray-500">
+                      当前为轻量版分析，基于文件名生成标签、标题建议和 BGM 风格推荐。
+                    </p>
+                  </div>
+                  {analysisLoading && <Loader2 className="h-5 w-5 animate-spin text-fuchsia-500" />}
+                </div>
+
+                {videoAnalysis ? (
+                  <div className="mt-6 space-y-6">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-[0.2em] text-gray-400">
+                        推荐标签
+                      </p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {videoAnalysis.tags.map((tag) => (
+                          <span
+                            key={tag}
+                            className="rounded-full bg-fuchsia-50 px-3 py-1 text-xs font-semibold text-fuchsia-600"
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+                      <div className="rounded-2xl bg-[#fafafa] p-5">
+                        <p className="text-xs font-bold uppercase tracking-[0.2em] text-gray-400">
+                          标题建议
+                        </p>
+                        <div className="mt-3 space-y-2">
+                          {videoAnalysis.titleSuggestions.map((title) => (
+                            <p
+                              key={title}
+                              className="rounded-xl bg-white px-4 py-3 text-sm font-medium text-gray-700"
+                            >
+                              {title}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="rounded-2xl bg-[#fafafa] p-5">
+                          <p className="text-xs font-bold uppercase tracking-[0.2em] text-gray-400">
+                            BGM 建议
+                          </p>
+                          <p className="mt-3 text-lg font-semibold text-[#1d1d1f]">
+                            {videoAnalysis.bgmRecommendation}
+                          </p>
+                        </div>
+                        <div className="rounded-2xl bg-[#fafafa] p-5">
+                          <p className="text-xs font-bold uppercase tracking-[0.2em] text-gray-400">
+                            内容摘要
+                          </p>
+                          <p className="mt-3 text-sm leading-6 text-gray-600">
+                            {videoAnalysis.summary}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-6 rounded-2xl border border-dashed border-gray-200 bg-[#fafafa] px-5 py-8 text-center text-sm text-gray-500">
+                    {analysisLoading ? '正在分析视频内容...' : '上传视频后，这里会自动给出标签、标题和配乐建议。'}
+                  </div>
+                )}
+              </section>
             </div>
           </div>
         </div>
@@ -422,10 +651,34 @@ export default function Home() {
       
       <footer className="mt-32 py-16 border-t border-gray-200/60 bg-white/50 backdrop-blur-sm text-center">
         <div className="max-w-7xl mx-auto px-6">
-          <p className="text-[13px] text-gray-400 font-medium tracking-wide italic">"Your Voice, Your Story, Your World."</p>
+          <p className="text-[13px] text-gray-400 font-medium tracking-wide italic">&quot;Your Voice, Your Story, Your World.&quot;</p>
           <p className="mt-4 text-[11px] text-gray-300 font-bold uppercase tracking-[0.3em]">© 2026 YourVoice AI Localization Lab.</p>
         </div>
       </footer>
     </main>
   );
+}
+
+function toBlobPart(data: Uint8Array | string): ArrayBuffer {
+  const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function getVideoDuration(file: File): Promise<number> {
+  return new Promise((resolve) => {
+    const tempUrl = URL.createObjectURL(file);
+    const media = document.createElement('video');
+
+    media.preload = 'metadata';
+    media.onloadedmetadata = () => {
+      const duration = Number.isFinite(media.duration) ? media.duration : 0;
+      URL.revokeObjectURL(tempUrl);
+      resolve(duration);
+    };
+    media.onerror = () => {
+      URL.revokeObjectURL(tempUrl);
+      resolve(0);
+    };
+    media.src = tempUrl;
+  });
 }
